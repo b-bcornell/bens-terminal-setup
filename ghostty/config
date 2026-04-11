@@ -1,0 +1,19 @@
+theme = Catppuccin Macchiato
+working-directory = inherit
+keybind = super+k=text:\x0b
+keybind = super+l=clear_screen
+keybind = super+a=text:\x01C
+keybind = shift+left=previous_tab
+keybind = shift+right=next_tab
+keybind = command+f=text:\x01f
+# Tmux scrolling (prefix=Ctrl+A, then [ for copy-mode, then vi motion)
+keybind = command+up=text:\x01[k
+keybind = command+down=text:\x01[j
+keybind = command+shift+up=text:\x01[\x15
+keybind = command+shift+down=text:\x01[\x04
+keybind = command+shift+left=move_tab:-1
+keybind = command+shift+right=move_tab:1
+keybind = command+left=goto_split:left
+keybind = command+right=goto_split:right
+keybind = command+shift+r=prompt_surface_title
+
