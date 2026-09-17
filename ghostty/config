@@ -17,3 +17,16 @@ keybind = command+left=goto_split:left
 keybind = command+right=goto_split:right
 keybind = command+shift+r=prompt_surface_title
 
+# An outer Ghostty tab is a group; its tmux windows are inner tabs.
+keybind = super+alt+t=text:\x01c
+keybind = super+alt+left=text:\x01p
+keybind = super+alt+right=text:\x01n
+keybind = super+alt+r=text:\x01,
+keybind = super+alt+g=prompt_tab_title
+# Merge a group left/right, pop an inner tab out, or toggle tiled panes.
+keybind = super+alt+shift+left=text:\x01G
+keybind = super+alt+shift+right=text:\x01O
+keybind = super+alt+shift+up=text:\x01P
+keybind = super+alt+shift+down=text:\x01T
+keybind = super+alt+b=text:\x01B
+keybind = super+alt+shift+b=text:\x01V

@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Remember the active agent session for a tmux pane without logging prompts."""
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in {"codex", "claude"}:
+        return
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane.startswith("%") or not pane[1:].isdigit():
+        return
+    event = json.load(sys.stdin)
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+    directory = Path(os.environ.get("TAB_GROUP_DATA_DIR", str(Path.home() / ".local/share/tab-groups"))) / "sessions"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = directory / f"{pane[1:]}.json"
+    record = {
+        "tool": sys.argv[1],
+        "session_id": session_id,
+        "cwd": event.get("cwd"),
+        "recorded_at": time.time(),
+        "transcript_path": event.get("transcript_path"),
+    }
+    fd, temporary = tempfile.mkstemp(prefix=".session-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream)
+            stream.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # Session tracking must never block Codex or Claude startup.

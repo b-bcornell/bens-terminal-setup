@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""Move and tile live tmux windows across Ghostty tab groups."""
+import base64
+import datetime
+import hashlib
+import re
+import shlex
+import shutil
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROBE_OPTION = "@tab_group_probe"
+TILE_OPTION = "@tab_group_tile"
+
+
+def run(*args, check=True):
+    result = subprocess.run(args, text=True, capture_output=True)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"Command failed: {args[0]}")
+    return result.stdout.strip()
+
+
+def tmux(*args, check=True):
+    return run("tmux", *args, check=check)
+
+
+def osa(script, *args):
+    return run("osascript", "-e", script, *args)
+
+
+SELECTED_TAB = '''on run argv
+  tell application "Ghostty"
+    set w to front window
+    set t to selected tab of w
+    return (id of t) & "|" & ((index of t) as text) & "|" & ((count of tabs of w) as text)
+  end tell
+end run'''
+
+TAB_AT_INDEX = '''on run argv
+  tell application "Ghostty" to return id of item ((item 1 of argv) as integer) of tabs of front window
+end run'''
+
+PROBE_TAB = '''on run argv
+  tell application "Ghostty"
+    repeat with t in tabs of front window
+      if (id of t) is (item 1 of argv) then
+        return perform action "text:\\\\x01U" on (focused terminal of t)
+      end if
+    end repeat
+  end tell
+  error "Ghostty tab was not found"
+end run'''
+
+NEW_TAB = '''on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set initial working directory of cfg to item 1 of argv
+    set t to new tab in front window with configuration cfg
+    return id of t
+  end tell
+end run'''
+
+CLOSE_TAB = '''on run argv
+  tell application "Ghostty"
+    repeat with t in tabs of front window
+      if (id of t) is (item 1 of argv) then
+        close tab t
+        return true
+      end if
+    end repeat
+  end tell
+  error "Ghostty tab was not found"
+end run'''
+
+
+def selected_tab():
+    tab_id, index, count = osa(SELECTED_TAB).split("|")
+    return tab_id, int(index), int(count)
+
+
+def probe(tab_id, timeout=5):
+    tmux("set-option", "-g", PROBE_OPTION, "pending")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            osa(PROBE_TAB, tab_id)
+        except RuntimeError:
+            time.sleep(0.15)
+            continue
+        for _ in range(5):
+            result = tmux("show-options", "-gv", PROBE_OPTION)
+            if result != "pending":
+                return result
+            time.sleep(0.1)
+    raise RuntimeError("Could not identify the Ghostty tab's tmux session")
+
+
+def pane_session(pane):
+    return tmux("display-message", "-p", "-t", pane, "#{session_id}")
+
+
+def windows(session):
+    output = tmux("list-windows", "-t", session, "-F", "#{window_id}")
+    return output.splitlines() if output else []
+
+
+def tile_state(session):
+    encoded = tmux("show-options", "-qv", "-t", session, TILE_OPTION)
+    return json.loads(base64.b64decode(encoded)) if encoded else None
+
+
+def tile(session, active_pane):
+    if tile_state(session):
+        untile(session)
+        return "Restored inner tabs"
+    window_ids = windows(session)
+    if len(window_ids) < 2:
+        return "This group needs at least two inner tabs to tile"
+    records = []
+    for window_id in window_ids:
+        panes = tmux("list-panes", "-t", window_id, "-F", "#{pane_id}").splitlines()
+        if len(panes) != 1:
+            raise RuntimeError("Tiling requires one pane per inner tab")
+        records.append({
+            "pane": panes[0],
+            "name": tmux("display-message", "-p", "-t", window_id, "#{window_name}"),
+            "index": int(tmux("display-message", "-p", "-t", window_id, "#{window_index}")),
+        })
+    base_window = tmux("display-message", "-p", "-t", active_pane, "#{window_id}")
+    state = {"records": records, "base": base_window, "active": active_pane}
+    encoded = base64.b64encode(json.dumps(state).encode()).decode()
+    tmux("set-option", "-t", session, TILE_OPTION, encoded)
+    for record in records:
+        if tmux("display-message", "-p", "-t", record["pane"], "#{window_id}") != base_window:
+            tmux("join-pane", "-d", "-s", record["pane"], "-t", base_window)
+    tmux("select-layout", "-t", base_window, "tiled")
+    tmux("select-pane", "-t", active_pane)
+    return "Tiled all inner tabs; run again to restore them"
+
+
+def untile(session):
+    state = tile_state(session)
+    if not state:
+        return
+    records = state["records"]
+    for record in records:
+        pane = record["pane"]
+        current_window = tmux("display-message", "-p", "-t", pane, "#{window_id}")
+        if current_window == state["base"] and pane != state["active"]:
+            tmux("break-pane", "-d", "-s", pane, "-t", session + ":", "-n", record["name"])
+    for position, record in enumerate(sorted(records, key=lambda item: item["index"])):
+        window_id = tmux("display-message", "-p", "-t", record["pane"], "#{window_id}")
+        current_at_position = tmux("display-message", "-p", "-t", f"{session}:{position}", "#{window_id}", check=False)
+        if current_at_position and current_at_position != window_id:
+            tmux("swap-window", "-d", "-s", window_id, "-t", f"{session}:{position}")
+    tmux("select-window", "-t", state["base"])
+    tmux("select-pane", "-t", state["active"])
+    tmux("set-option", "-u", "-t", session, TILE_OPTION)
+
+
+def checked_source(source_pane):
+    source_session = pane_session(source_pane)
+    source_tab, source_index, tab_count = selected_tab()
+    if probe(source_tab) != source_session:
+        raise RuntimeError("The selected Ghostty tab does not match this tmux group")
+    return source_session, source_tab, source_index, tab_count
+
+
+def merge(direction, source_pane):
+    source_session, source_tab, source_index, tab_count = checked_source(source_pane)
+    neighbor_index = source_index + (-1 if direction == "left" else 1)
+    if not 1 <= neighbor_index <= tab_count:
+        raise RuntimeError(f"There is no tab group to the {direction}")
+    target_tab = osa(TAB_AT_INDEX, str(neighbor_index))
+    target_session = probe(target_tab)
+    if target_session == source_session:
+        raise RuntimeError("Both Ghostty tabs use the same tmux session")
+    untile(source_session)
+    untile(target_session)
+    source_windows = windows(source_session)
+    active_window = tmux("display-message", "-p", "-t", source_pane, "#{window_id}")
+    if not source_windows:
+        raise RuntimeError("Current group has no inner tabs")
+    moved = []
+    try:
+        for window_id in source_windows:
+            tmux("move-window", "-s", window_id, "-t", target_session + ":")
+            moved.append(window_id)
+    except Exception:
+        for window_id in reversed(moved):
+            tmux("move-window", "-s", window_id, "-t", source_session + ":", check=False)
+        raise
+    tmux("select-window", "-t", active_window)
+    osa(CLOSE_TAB, source_tab)
+    return f"Moved {len(source_windows)} inner tab(s) to the {direction} group"
+
+
+def pop(source_pane):
+    source_session, _, _, _ = checked_source(source_pane)
+    untile(source_session)
+    if len(windows(source_session)) < 2:
+        return "This inner tab already has its own group"
+    source_window = tmux("display-message", "-p", "-t", source_pane, "#{window_id}")
+    cwd = tmux("display-message", "-p", "-t", source_pane, "#{pane_current_path}")
+    new_tab = osa(NEW_TAB, cwd)
+    try:
+        target_session = probe(new_tab, timeout=8)
+        if target_session == source_session:
+            raise RuntimeError("New tab did not start its own tmux session")
+        placeholders = windows(target_session)
+        if len(placeholders) != 1:
+            raise RuntimeError("New group did not start with one empty inner tab")
+        tmux("move-window", "-s", source_window, "-t", target_session + ":")
+        tmux("select-window", "-t", source_window)
+        tmux("kill-window", "-t", placeholders[0])
+    except Exception:
+        if source_window in windows(source_session):
+            osa(CLOSE_TAB, new_tab)
+        raise
+    return "Popped inner tab into a new group"
+
+
+# Bookmarks store the group layout and exact local Codex/Claude conversation IDs.
+BOOKMARK_ROOT = Path(os.environ.get("TAB_GROUP_DATA_DIR", str(Path.home() / ".local/share/tab-groups")))
+BOOKMARK_DIR = BOOKMARK_ROOT / "bookmarks"
+ARCHIVE_DIR = BOOKMARK_ROOT / "archives"
+SESSION_DIR = BOOKMARK_ROOT / "sessions"
+UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+TAB_NAME = '''on run argv
+  tell application "Ghostty"
+    repeat with t in tabs of front window
+      if (id of t) is (item 1 of argv) then return name of t
+    end repeat
+  end tell
+  error "Ghostty tab was not found"
+end run'''
+
+SET_TAB_NAME = '''on run argv
+  tell application "Ghostty"
+    repeat with t in tabs of front window
+      if (id of t) is (item 1 of argv) then
+        return perform action ("set_tab_title:" & (item 2 of argv)) on (focused terminal of t)
+      end if
+    end repeat
+  end tell
+  error "Ghostty tab was not found"
+end run'''
+
+CHOOSE_BOOKMARK = '''on run argv
+  set choice to choose from list argv
+  if choice is false then return ""
+  return item 1 of choice
+end run'''
+
+
+def bookmark_path(name):
+    digest = hashlib.sha256(name.encode()).hexdigest()
+    return BOOKMARK_DIR / (digest + ".json"), digest
+
+
+def validate_bookmark_name(name):
+    name = name.strip()
+    if not name or len(name) > 100 or any(ord(char) < 32 for char in name):
+        raise RuntimeError("Bookmark name must be 1–100 characters on one line")
+    return name
+
+
+def process_descendants(root_pid):
+    pairs = []
+    for line in run("ps", "-axo", "pid=,ppid=").splitlines():
+        try:
+            pid, parent = (int(x) for x in line.split()[:2])
+            pairs.append((pid, parent))
+        except (ValueError, IndexError):
+            continue
+    children = {}
+    for pid, parent in pairs:
+        children.setdefault(parent, []).append(pid)
+    queue = list(children.get(root_pid, []))
+    while queue:
+        pid = queue.pop(0)
+        yield pid
+        queue.extend(children.get(pid, []))
+
+
+def process_start(pid):
+    started = run("ps", "-p", str(pid), "-o", "lstart=")
+    parsed = datetime.datetime.strptime(started, "%a %b %d %H:%M:%S %Y")
+    return time.mktime(parsed.timetuple())
+
+
+def agent_process(pane):
+    root_pid = int(tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+    foreground = tmux("display-message", "-p", "-t", pane, "#{pane_current_command}").lower()
+    if foreground in {"zsh", "bash", "fish", "sh"}:
+        return None
+    for pid in process_descendants(root_pid):
+        args = run("ps", "-p", str(pid), "-o", "args=", check=False)
+        if not args:
+            continue
+        program = Path(args.split()[0]).name.lower()
+        if program == "codex" and foreground == "codex":
+            return "codex", pid, args
+        if program == "claude" and (foreground == "claude" or re.fullmatch(r"\d+\.\d+\.\d+", foreground)):
+            return "claude", pid, args
+    if foreground == "codex" or foreground == "claude" or re.fullmatch(r"\d+\.\d+\.\d+", foreground):
+        raise RuntimeError(f"Could not identify the active agent process in pane {pane}")
+    return None
+
+
+def find_transcript(tool, session_id):
+    if tool == "codex":
+        paths = list((Path.home() / ".codex/sessions").glob(f"*/*/*/rollout-*{session_id}.jsonl"))
+    else:
+        paths = list((Path.home() / ".claude/projects").glob(f"*/{session_id}.jsonl"))
+    return paths[0] if len(paths) == 1 else None
+
+
+def recorded_session(pane, tool, started):
+    path = SESSION_DIR / (pane[1:] + ".json")
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if record.get("tool") == tool and record.get("recorded_at", 0) >= started - 2:
+        session_id = record.get("session_id", "")
+        if UUID_PATTERN.fullmatch(session_id):
+            return session_id
+    return None
+
+
+def session_from_codex_start(started, cwd):
+    base = Path.home() / ".codex/sessions"
+    candidates = []
+    for day_offset in (-1, 0, 1):
+        day = datetime.datetime.fromtimestamp(started) + datetime.timedelta(days=day_offset)
+        folder = base / day.strftime("%Y/%m/%d")
+        for path in folder.glob("rollout-*.jsonl"):
+            try:
+                with path.open() as stream:
+                    line = json.loads(stream.readline())
+                meta = line.get("payload", {})
+                timestamp = datetime.datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
+                if line.get("type") == "session_meta" and meta.get("source") == "cli" and meta.get("cwd") == cwd and -3 <= timestamp - started <= 40:
+                    candidates.append((abs(timestamp - started), meta["id"]))
+            except (OSError, ValueError, KeyError):
+                continue
+    candidates.sort()
+    if len(candidates) == 1 or (len(candidates) > 1 and candidates[1][0] - candidates[0][0] > 2):
+        return candidates[0][1]
+    return None
+
+
+def session_from_claude_start(started, cwd):
+    base = Path.home() / ".claude/projects"
+    candidates = []
+    if not base.exists():
+        return None
+    for folder in base.iterdir():
+        if not folder.is_dir():
+            continue
+        for path in folder.glob("*.jsonl"):
+            try:
+                birth = path.stat().st_birthtime
+                if not -3 <= birth - started <= 40:
+                    continue
+                heads = []
+                with path.open() as stream:
+                    for _ in range(20):
+                        line = stream.readline()
+                        if not line:
+                            break
+                        heads.append(json.loads(line))
+                if any(item.get("cwd") == cwd for item in heads) and UUID_PATTERN.fullmatch(path.stem):
+                    candidates.append((abs(birth - started), path.stem))
+            except (OSError, ValueError):
+                continue
+    candidates.sort()
+    if len(candidates) == 1 or (len(candidates) > 1 and candidates[1][0] - candidates[0][0] > 2):
+        return candidates[0][1]
+    return None
+
+
+def session_for_pane(pane, cwd):
+    process = agent_process(pane)
+    if process is None:
+        return {"tool": "shell"}
+    tool, pid, args = process
+    started = process_start(pid)
+    session_id = recorded_session(pane, tool, started)
+    if not session_id:
+        if tool == "codex":
+            match = re.search(r"\bcodex\s+resume\s+(" + UUID_PATTERN.pattern + r")", args, re.I)
+        else:
+            match = re.search(r"--session-id(?:=|\s+)(" + UUID_PATTERN.pattern + r")", args, re.I)
+            if not match and "--fork-session" not in args:
+                match = re.search(r"--resume(?:=|\s+)(?:\S*/)?(" + UUID_PATTERN.pattern + r")", args, re.I)
+        if match:
+            session_id = match.group(1)
+    if not session_id:
+        session_id = (session_from_codex_start(started, cwd) if tool == "codex" else session_from_claude_start(started, cwd))
+    transcript = find_transcript(tool, session_id) if session_id else None
+    if not transcript:
+        raise RuntimeError(f"Could not pin the exact {tool.title()} session for pane {pane}; bookmark was not saved")
+    return {"tool": tool, "session_id": session_id, "transcript": str(transcript)}
+
+
+def group_records(session, source_pane):
+    state = tile_state(session)
+    if state:
+        pane_records = [(item["pane"], item["name"]) for item in sorted(state["records"], key=lambda x: x["index"])]
+        active_pane = state["active"]
+    else:
+        pane_records = []
+        for window in windows(session):
+            panes = tmux("list-panes", "-t", window, "-F", "#{pane_id}").splitlines()
+            if len(panes) != 1:
+                raise RuntimeError("Bookmarking requires one pane per inner tab")
+            name = tmux("display-message", "-p", "-t", window, "#{window_name}")
+            pane_records.append((panes[0], name))
+        active_pane = source_pane
+    records = []
+    active = 0
+    for index, (pane, name) in enumerate(pane_records):
+        cwd = tmux("display-message", "-p", "-t", pane, "#{pane_current_path}")
+        record = {"name": name, "cwd": cwd}
+        record.update(session_for_pane(pane, cwd))
+        records.append(record)
+        if pane == active_pane:
+            active = index
+    return records, active, bool(state)
+
+
+def copy_transcript(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = destination.with_name("." + destination.name + ".tmp")
+    with source.open("rb") as input_stream, temporary.open("wb") as output_stream:
+        shutil.copyfileobj(input_stream, output_stream)
+    with temporary.open("rb+") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        offset = size
+        complete_end = None
+        while offset:
+            chunk_size = min(offset, 1024 * 1024)
+            offset -= chunk_size
+            stream.seek(offset)
+            last_newline = stream.read(chunk_size).rfind(b"\n")
+            if last_newline >= 0:
+                complete_end = offset + last_newline + 1
+                break
+        if complete_end is None:
+            raise RuntimeError(f"Transcript has no complete JSONL record: {source}")
+        stream.truncate(complete_end)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+
+
+def save_bookmark(source_pane, requested_name=None):
+    session, tab_id, _, _ = checked_source(source_pane)
+    name = validate_bookmark_name(requested_name or osa(TAB_NAME, tab_id))
+    records, active, tiled = group_records(session, source_pane)
+    if not records:
+        raise RuntimeError("This group has no inner tabs")
+    BOOKMARK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive_revision = ARCHIVE_DIR / hashlib.sha256(name.encode()).hexdigest() / str(int(time.time() * 1000))
+    for index, record in enumerate(records):
+        if record["tool"] in {"codex", "claude"}:
+            source = Path(record["transcript"])
+            archive = archive_revision / str(index) / source.name
+            copy_transcript(source, archive)
+            if record["tool"] == "claude":
+                sidecar = source.with_suffix("")
+                if sidecar.is_dir():
+                    shutil.copytree(sidecar, archive.with_suffix(""))
+            record["archive"] = str(archive)
+    bookmark = {"version": 1, "name": name, "saved_at": time.time(), "tabs": records, "active": active, "tiled": tiled}
+    path, _ = bookmark_path(name)
+    temporary = path.with_name("." + path.name + ".tmp")
+    temporary.write_text(json.dumps(bookmark, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    return f"Bookmarked {name} ({len(records)} inner tabs)"
+
+
+def all_bookmarks():
+    if not BOOKMARK_DIR.exists():
+        return []
+    output = []
+    for path in BOOKMARK_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+            if data.get("version") == 1 and isinstance(data.get("name"), str):
+                output.append(data)
+        except (OSError, ValueError):
+            continue
+    return sorted(output, key=lambda item: item["name"].lower())
+
+
+def load_bookmark(name):
+    path, _ = bookmark_path(name)
+    if not path.exists():
+        raise RuntimeError(f"Bookmark not found: {name}")
+    data = json.loads(path.read_text())
+    if data.get("version") != 1 or data.get("name") != name:
+        raise RuntimeError("Bookmark file is invalid")
+    return data
+
+
+def agent_command(record):
+    tool = record["tool"]
+    if tool == "shell":
+        return []
+    session_id = record["session_id"]
+    original = Path(record["transcript"])
+    archive = Path(record.get("archive", ""))
+    if tool == "codex":
+        if not original.exists():
+            if not archive.is_file():
+                raise RuntimeError(f"Codex history is missing for {record['name']}")
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(archive, original)
+        return ["codex", "fork", session_id]
+    if tool == "claude":
+        if not original.exists():
+            if not archive.is_file():
+                raise RuntimeError(f"Claude history is missing for {record['name']}")
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(archive, original)
+            archive_sidecar = archive.with_suffix("")
+            if archive_sidecar.is_dir():
+                shutil.copytree(archive_sidecar, original.with_suffix(""), dirs_exist_ok=True)
+        return ["claude", "--resume", session_id, "--fork-session"]
+    raise RuntimeError(f"Unsupported saved tool: {tool}")
+
+
+def open_bookmark(name):
+    data = load_bookmark(name)
+    records = data["tabs"]
+    if not records:
+        raise RuntimeError("Bookmark has no inner tabs")
+    commands = []
+    for record in records:
+        if not Path(record["cwd"]).is_dir():
+            raise RuntimeError(f"Folder no longer exists: {record['cwd']}")
+        commands.append(agent_command(record))
+    new_tab = osa(NEW_TAB, records[0]["cwd"])
+    target_session = probe(new_tab, timeout=8)
+    restored = []
+    for index, (record, command) in enumerate(zip(records, commands)):
+        if index == 0:
+            placeholders = windows(target_session)
+            if len(placeholders) != 1:
+                raise RuntimeError("New group did not start with one inner tab")
+            window = placeholders[0]
+            tmux("rename-window", "-t", window, record["name"])
+            tmux("set-option", "-w", "-t", window, "automatic-rename", "off")
+            if command:
+                pane = tmux("list-panes", "-t", window, "-F", "#{pane_id}")
+                tmux("respawn-pane", "-k", "-t", pane, "-c", record["cwd"], shlex.join(command))
+        else:
+            new_command = [shlex.join(command)] if command else []
+            window = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", target_session, "-n", record["name"], "-c", record["cwd"], *new_command)
+            tmux("set-option", "-w", "-t", window, "automatic-rename", "off")
+        restored.append(window)
+    active = int(data.get("active", 0))
+    active = min(max(active, 0), len(restored) - 1)
+    tmux("select-window", "-t", restored[active])
+    if data.get("tiled") and len(restored) > 1:
+        pane = tmux("list-panes", "-t", restored[active], "-F", "#{pane_id}")
+        tile(target_session, pane)
+    osa(SET_TAB_NAME, new_tab, name)
+    return f"Opened bookmark {name} in a new group"
+
+
+def bookmark_command(args, source_pane):
+    if not args or args[0] not in {"save", "open", "choose", "list"}:
+        raise RuntimeError("Usage: tab-groups bookmark save [NAME] | open NAME | choose | list")
+    operation = args[0]
+    if operation == "save":
+        if not source_pane:
+            raise RuntimeError("Run bookmark save inside the group to save")
+        return save_bookmark(source_pane, " ".join(args[1:]) if len(args) > 1 else None)
+    if operation == "list":
+        entries = all_bookmarks()
+        return "\n".join(f"{item['name']} ({len(item['tabs'])} tabs)" for item in entries) or "No bookmarks saved"
+    if operation == "choose":
+        names = [item["name"] for item in all_bookmarks()]
+        if not names:
+            return "No bookmarks saved"
+        selected = osa(CHOOSE_BOOKMARK, *names)
+        return open_bookmark(selected) if selected else "Bookmark picker canceled"
+    if len(args) < 2:
+        raise RuntimeError("Usage: tab-groups bookmark open NAME")
+    return open_bookmark(" ".join(args[1:]))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in {"merge", "pop", "panes", "bookmark"}:
+        raise RuntimeError("Usage: tab-groups merge left|right | pop | panes | bookmark save|open|choose|list")
+    command = sys.argv[1]
+    if command == "merge" and (len(sys.argv) < 3 or sys.argv[2] not in {"left", "right"}):
+        raise RuntimeError("Usage: tab-groups merge left|right")
+    source_pane = sys.argv[-1] if sys.argv[-1].startswith("%") else os.environ.get("TMUX_PANE")
+    if not source_pane and command != "bookmark":
+        raise RuntimeError("Run this command inside a tmux group")
+    with Path(f"/private/tmp/tab-groups-{os.getuid()}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if command == "bookmark":
+            bookmark_args = sys.argv[2:-1] if sys.argv[-1].startswith("%") else sys.argv[2:]
+            message = bookmark_command(bookmark_args, source_pane)
+        elif command == "merge":
+            message = merge(sys.argv[2], source_pane)
+        elif command == "pop":
+            message = pop(source_pane)
+        else:
+            message = tile(pane_session(source_pane), source_pane)
+    if command == "bookmark":
+        print(message)
+    if command == "bookmark" and source_pane:
+        tmux("display-message", "-d", "5000", "-t", source_pane, message, check=False)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"tab-groups: {error}", file=sys.stderr)
+        pane = sys.argv[-1] if sys.argv[-1].startswith("%") else os.environ.get("TMUX_PANE")
+        if pane:
+            tmux("display-message", "-d", "6000", "-t", pane, f"tab-groups: {error}", check=False)
+        sys.exit(1)

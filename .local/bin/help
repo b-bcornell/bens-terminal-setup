@@ -1,0 +1,57 @@
+#!/bin/sh
+
+cat <<'EOF'
+Ghostty + tmux help
+
+Keys: ⌘ Command   ⌥ Option   ⇧ Shift   ⌃ Control
+
+Ghostty
+  ⌘K                    Clear the screen and scrollback
+  ⌘L                    Clear the visible screen
+  ⌘A                    Copy all tmux scrollback to the clipboard
+  ⇧← / ⇧→               Select the previous / next outer tab
+  ⌘F                    Fuzzy-search tmux scrollback
+  ⌘↑ / ⌘↓               Scroll tmux history one line
+  ⌘⇧↑ / ⌘⇧↓             Scroll tmux history half a page
+  ⌘⇧← / ⌘⇧→             Move the outer tab left / right
+  ⌘← / ⌘→               Focus the Ghostty split to the left / right
+  ⌘⇧R                   Rename the current Ghostty surface
+
+Tab groups (Ghostty shortcuts)
+  ⌘⌥T                   Create an inner tab
+  ⌘⌥← / ⌘⌥→             Select the previous / next inner tab
+  ⌘⌥R                   Rename the inner tab
+  ⌘⌥G                   Rename the outer tab group
+  ⌘⌥⇧← / ⌘⌥⇧→           Merge this group into the group on the left / right
+  ⌘⌥⇧↑                  Pop the current inner tab into a new outer group
+  ⌘⌥⇧↓                  Toggle all inner tabs as tiled panes
+  ⌘⌥B                   Save the current group as a bookmark
+  ⌘⌥⇧B                  Choose and open a saved bookmark
+
+tmux equivalents
+  ⌃A                    Prefix (replaces ⌃B); press twice to send ⌃A
+  ⌃K                    Clear the screen and scrollback (no prefix)
+  Prefix f              Fuzzy-search scrollback
+  Prefix [              Enter copy mode; use vi movement and y to copy
+  Prefix C              Copy all scrollback to the clipboard
+  Prefix c              Create an inner tab in the current directory
+  Prefix p / n          Select the previous / next inner tab or tiled pane
+  Prefix ,              Rename the inner tab
+  Prefix G / O          Merge this group left / right
+  Prefix P              Pop the current inner tab into a new group
+  Prefix T              Toggle tiled panes
+  Prefix B              Save this group as a bookmark
+  Prefix V              Choose and open a saved bookmark
+
+Commands
+  help                              Show this help
+  tab-groups merge left|right       Merge this group into an adjacent group
+  tab-groups pop                    Pop this inner tab into a new group
+  tab-groups panes                  Toggle all inner tabs as tiled panes
+  tab-groups bookmark save [NAME]   Save this group (defaults to its tab name)
+  tab-groups bookmark choose        Choose and open a bookmark
+  tab-groups bookmark open NAME     Open a bookmark by name
+  tab-groups bookmark list          List saved bookmarks
+
+Outer tabs are Ghostty tabs. Inner tabs are tmux windows inside each outer tab.
+EOF
